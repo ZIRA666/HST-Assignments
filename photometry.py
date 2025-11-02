@@ -1,0 +1,487 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from astropy.io import fits
+from scipy.optimize import curve_fit
+from scipy.ndimage import gaussian_filter, maximum_filter
+import glob
+import os
+from pathlib import Path
+
+get_ipython  # type: ignore
+#matplotlib inline  # type: ignore
+
+# ============================================================================
+# SECTION 1: COSMIC RAY REMOVAL
+# ============================================================================
+
+def load_and_combine_images(directory):
+    """
+    Load all FITS files from a directory and median-combine them.
+
+    Returns combined image and header from first file (if any).
+    Also saves a text copy of the median image as "median_image.txt" in the directory.
+
+    Parameters
+    ----------
+    directory : str or Path
+        Path to directory containing FITS files
+
+    Returns
+    -------
+    combined_image : numpy.ndarray
+    header : astropy.io.fits.Header or None
+    """
+    directory = Path(directory)
+    fits_files = sorted(glob.glob(str(directory / "*.fits")))
+
+    if len(fits_files) == 0:
+        raise ValueError(f"No FITS files found in {directory}")
+
+    print(f"\nFound {len(fits_files)} FITS files in {directory}")
+
+    images = []
+    header = None
+    
+    for fits_file in fits_files:
+        with fits.open(fits_file) as hdul:
+            # Find the first HDU with data
+            data = None
+            for hdu in hdul:
+                if hdu.data is not None:
+                    data = hdu.data
+                    if header is None:
+                        header = hdu.header.copy()
+                    break
+            
+            if data is not None:
+                images.append(data)
+            else:
+                print(f"Warning: No data found in {fits_file.name}")
+    
+    if len(images) == 0:
+        raise ValueError(f"No valid image data found in {directory}")
+    
+    # Median combine
+    combined_image = np.median(images, axis=0)
+    print(f"Median-combined {len(images)} images")
+
+    # Save plain text median image for quick inspection (as requested)
+    txt_out = directory / "median_image.txt"
+    try:
+        # To keep file small, save as 2D text with a reasonable fmt
+        np.savetxt(txt_out, combined_image, fmt="%.6e")
+        print(f"Saved median image as text to: {txt_out}")
+    except Exception as e:
+        print(f"Could not save median text file: {e}")
+
+    return combined_image, header
+
+
+# ============================================================================
+# SECTION 2: STAR FINDING
+# ============================================================================
+
+def gaussian_2d(xy, amplitude, xo, yo, sigma_x, sigma_y, offset):
+    x, y = xy
+    g = offset + amplitude * np.exp(-(
+        ((x - xo)**2 / (2 * sigma_x**2)) +
+        ((y - yo)**2 / (2 * sigma_y**2))
+    ))
+    return g.ravel()
+
+
+def find_local_maxima(image, box_size=5, threshold=None):
+    """
+    Find local maxima in an image using maximum filter.
+    Returns array of (y, x) coordinates.
+    """
+    # Apply maximum filter
+    max_filtered = maximum_filter(image, size=box_size)
+
+    # Find where image equals the max filtered (local maxima)
+    maxima_mask = (image == max_filtered)
+
+    # Apply threshold if provided
+    if threshold is not None:
+        maxima_mask &= (image > threshold)
+
+    # Remove border maxima that are within half-box of the edge (so fitting cutouts fit)
+    half = box_size // 2
+    maxima = np.argwhere(maxima_mask)
+    good = []
+    for y, x in maxima:
+        if (y >= half) and (x >= half) and (y < image.shape[0] - half) and (x < image.shape[1] - half):
+            good.append((y, x))
+    return np.array(good)
+
+
+def check_ellipticity(sigma_x, sigma_y, etol=0.6):
+    if sigma_x <= 0 or sigma_y <= 0:
+        return False
+    f = 1 - (min(sigma_x, sigma_y) / max(sigma_x, sigma_y))
+    return f <= etol
+
+
+def check_size(sigma_x, sigma_y, min_sigma=0.5, max_sigma=6.0):
+    avg_sigma = (sigma_x + sigma_y) / 2
+    return (min_sigma <= avg_sigma <= max_sigma)
+
+
+def fit_source(image, y, x, box_size=9):
+    half_box = box_size // 2
+    y_min = max(0, y - half_box)
+    y_max = min(image.shape[0], y + half_box + 1)
+    x_min = max(0, x - half_box)
+    x_max = min(image.shape[1], x + half_box + 1)
+
+    cutout = image[y_min:y_max, x_min:x_max]
+    if cutout.size == 0 or cutout.shape[0] < 5 or cutout.shape[1] < 5:
+        return None
+
+    yy, xx = np.mgrid[0:cutout.shape[0], 0:cutout.shape[1]]
+
+    amplitude_guess = np.max(cutout) - np.median(cutout)
+    amplitude_guess = max(amplitude_guess, 1.0)  # avoid zero initial amplitude
+    xo_guess = cutout.shape[1] / 2
+    yo_guess = cutout.shape[0] / 2
+    sigma_guess = 2.0
+    offset_guess = np.median(cutout)
+
+    initial_guess = [amplitude_guess, xo_guess, yo_guess,
+                     sigma_guess, sigma_guess, offset_guess]
+
+    try:
+        popt, _ = curve_fit(gaussian_2d, (xx, yy), cutout.ravel(),
+                           p0=initial_guess, maxfev=2000)
+
+        amplitude, xo, yo, sigma_x, sigma_y, offset = popt
+
+        if amplitude <= 0:
+            return None
+
+        if offset < -1e3:  # unrealistic offset
+            return None
+
+        if not check_ellipticity(sigma_x, sigma_y):
+            return None
+
+        if not check_size(sigma_x, sigma_y):
+            return None
+
+        global_x = x_min + xo
+        global_y = y_min + yo
+
+        return {
+            'x': float(global_x),
+            'y': float(global_y),
+            'amplitude': float(amplitude),
+            'sigma_x': float(abs(sigma_x)),
+            'sigma_y': float(abs(sigma_y)),
+            'offset': float(offset)
+        }
+
+    except (RuntimeError, ValueError) as e:
+        # Fit failed
+        return None
+
+
+def find_stars(image, sigma=0.5, threshold_factor=1.0, box_size=9):
+    """
+    Full star finding pipeline: smooth, threshold, local maxima, fit Gaussian.
+    Returns catalog (list of dicts).
+    """
+    print("\n" + "="*70)
+    print("STAR FINDING")
+    print("="*70)
+
+    smoothed = gaussian_filter(image, sigma=sigma)
+
+    background = np.median(smoothed)
+    noise = np.std(smoothed)
+    threshold = background + threshold_factor * noise
+
+    print(f"Background: {background:.2f}, Noise: {noise:.2f}, Threshold: {threshold:.2f}")
+
+    maxima = find_local_maxima(smoothed, box_size=5, threshold=threshold)
+    print(f"Found {len(maxima)} initial peaks (after border filtering)")
+
+    catalog = []
+    for i, (y, x) in enumerate(maxima):
+        # progress print for large catalogs
+        if i % 500 == 0 and i > 0:
+            print(f"  Processed {i} peaks...")
+        res = fit_source(image, int(y), int(x), box_size=box_size)
+        if res is not None:
+            res['id'] = len(catalog) + 1
+            catalog.append(res)
+
+    print(f"Final catalog: {len(catalog)} stars")
+    return catalog
+
+
+# ============================================================================
+# SECTION 3: PHOTOMETRY
+# ============================================================================
+
+def aperture_photometry(image, x, y, aperture_radius=5,
+                        sky_inner=8, sky_outer=12):
+    """
+    Circular aperture photometry with local sky annulus (median).
+    """
+    ny, nx = image.shape
+    yy, xx = np.ogrid[:ny, :nx]
+    r = np.sqrt((xx - x)**2 + (yy - y)**2)
+
+    aperture_mask = r <= aperture_radius
+    sky_mask = (r >= sky_inner) & (r <= sky_outer)
+
+    if np.sum(aperture_mask) == 0:
+        return 0.0
+
+    if np.sum(sky_mask) > 0:
+        sky_median = np.median(image[sky_mask])
+    else:
+        sky_median = 0.0
+
+    aperture_flux = np.sum(image[aperture_mask])
+    n_ap = np.sum(aperture_mask)
+    sky_flux = sky_median * n_ap
+
+    source_flux = aperture_flux - sky_flux
+    return float(source_flux)
+
+
+def flux_to_magnitude(flux, zeropoint=25.0):
+    if flux > 0:
+        return float(-2.5 * np.log10(flux) + zeropoint)
+    else:
+        return np.nan
+
+
+def perform_photometry(image, catalog, aperture_radius=5):
+    """
+    Add 'flux' and 'magnitude' to each source in catalog.
+    Returns filtered catalog removing NaN magnitudes.
+    """
+    print("\n" + "="*70)
+    print("PHOTOMETRY")
+    print("="*70)
+    print(f"Aperture radius: {aperture_radius} px")
+
+    for source in catalog:
+        flux = aperture_photometry(image, source['x'], source['y'],
+                                   aperture_radius=aperture_radius)
+        source['flux'] = flux
+        source['magnitude'] = flux_to_magnitude(flux)
+
+    valid = [s for s in catalog if not np.isnan(s['magnitude'])]
+    print(f"Valid sources after photometry: {len(valid)} (out of {len(catalog)})")
+    return valid
+
+
+# ============================================================================
+# SECTION 4: CROSS-MATCHING AND PLOTTING
+# ============================================================================
+
+def cross_match_catalogs(cat1, cat2, max_distance=2.0):
+    """
+    Simple nearest-neighbour cross-match (cat1 -> cat2).
+    """
+    print("\n" + "="*40)
+    print("CROSS-MATCHING CATALOGS")
+    print("="*40)
+
+    matched = []
+    for s1 in cat1:
+        best_match = None
+        best_dist = max_distance
+        for s2 in cat2:
+            dist = np.hypot(s1['x'] - s2['x'], s1['y'] - s2['y'])
+            if dist < best_dist:
+                best_dist = dist
+                best_match = s2
+        if best_match is not None:
+            matched.append({
+                'id': len(matched) + 1,
+                'x': (s1['x'] + best_match['x']) / 2.0,
+                'y': (s1['y'] + best_match['y']) / 2.0,
+                'mag_f336w': s1['magnitude'],
+                'mag_f555w': best_match['magnitude'],
+                'flux_f336w': s1['flux'],
+                'flux_f555w': best_match['flux']
+            })
+
+    print(f"Matched {len(matched)} sources")
+    return matched
+
+
+def visualize_median_images(f336w_combined, f555w_combined,
+                            output_file='median_images.png'):
+    print("\nVisualizing median-combined images...")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    vmin_336, vmax_336 = np.percentile(f336w_combined, [1, 99])
+    axes[0].imshow(f336w_combined, cmap='gray', origin='lower', vmin=vmin_336, vmax=vmax_336)
+    axes[0].set_title('F336W - Median Combined')
+
+    vmin_555, vmax_555 = np.percentile(f555w_combined, [1, 99])
+    axes[1].imshow(f555w_combined, cmap='gray', origin='lower', vmin=vmin_555, vmax=vmax_555)
+    axes[1].set_title('F555W - Median Combined')
+
+    for ax in axes:
+        ax.set_xlabel('X (pixels)')
+        ax.set_ylabel('Y (pixels)')
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=200, bbox_inches='tight')
+    print(f"Saved median images to {output_file}")
+    plt.show()
+    return fig
+
+
+def visualize_detected_stars(image, catalog, title='Detected Stars',
+                             output_file='detected_stars.png', max_display=500):
+    print(f"\nVisualizing detected stars: {title} (show up to {max_display})")
+    fig, ax = plt.subplots(figsize=(8, 8))
+    vmin, vmax = np.percentile(image, [1, 99])
+    ax.imshow(image, cmap='gray', origin='lower', vmin=vmin, vmax=vmax)
+    x_coords = [s['x'] for s in catalog[:max_display]]
+    y_coords = [s['y'] for s in catalog[:max_display]]
+    ax.scatter(x_coords, y_coords, s=40, facecolors='none', edgecolors='red', linewidths=0.7)
+    ax.set_title(f"{title} - N={len(catalog)}")
+    ax.set_xlabel('X (pixels)')
+    ax.set_ylabel('Y (pixels)')
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=200, bbox_inches='tight')
+    print(f"Saved to {output_file}")
+    plt.show()
+    return fig
+
+
+def create_hr_diagram(matched_catalog, output_file='hr_diagram.png'): 
+    print("\nCreating HR diagram...")
+    mag_f555w = np.array([s['mag_f555w'] for s in matched_catalog]) 
+    mag_f336w = np.array([s['mag_f336w'] for s in matched_catalog])
+    color = mag_f336w - mag_f555w
+
+    fig, ax = plt.subplots(figsize=(14, 10))
+    #hb = ax.hexbin(color, mag_f336w, cmap='black', mincnt=1)
+    ax.scatter(color, mag_f336w, s=2, color='k', alpha=0.6)
+    ax.set_xlabel('F336W - F555W (mag)')
+    ax.set_ylabel('F336W (mag)')
+    ax.invert_yaxis()
+    ax.grid(True, linestyle=':', linewidth=0.5, color='gray', alpha=0.7)
+    #plt.colorbar(hb, ax=ax, label='Counts')
+    plt.title(f'HR Diagram - N={len(matched_catalog)}')
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=200, bbox_inches='tight')
+    print(f"Saved HR diagram to {output_file}")
+    plt.show()
+    return fig
+
+
+def save_catalog(catalog, filename):
+    filename = Path(filename)
+    if len(catalog) == 0:
+        print(f"No entries to save for {filename}")
+        return
+
+    # Determine format by keys
+    with open(filename, 'w') as f:
+        if 'mag_f336w' in catalog[0]:
+            f.write("# ID  X  Y  MAG_F336W  MAG_F555W  FLUX_F336W  FLUX_F555W\n")
+            for s in catalog:
+                f.write(f"{s['id']:5d}  {s['x']:8.2f}  {s['y']:8.2f}  "
+                        f"{s['mag_f336w']:8.3f}  {s['mag_f555w']:8.3f}  "
+                        f"{s['flux_f336w']:10.2f}  {s['flux_f555w']:10.2f}\n")
+        else:
+            f.write("# ID  X  Y  MAGNITUDE  FLUX\n")
+            for s in catalog:
+                f.write(f"{s['id']:5d}  {s['x']:8.2f}  {s['y']:8.2f}  "
+                        f"{s['magnitude']:8.3f}  {s['flux']:10.2f}\n")
+    print(f"Saved catalog to {filename}")
+
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
+
+def main():
+    print("\n" + "="*60)
+    print("HST PHOTOMETRY ASSIGNMENTS - NGC 1261")
+    print("="*60)
+
+    # Adjust these to where your FITS directories live.
+    # The script will save median images text file inside these directories too.
+    f336w_dir = "HST-Assignments/data/F336W"
+    f555w_dir = "HST-Assignments/data/F555W"
+
+    # If running interactively and your folders are different, update before calling main().
+    for d in (f336w_dir, f555w_dir):
+        if not os.path.isdir(d):
+            print(f"Warning: directory does not exist: {d}")
+
+    # Step 1: combine
+    print("\nStep 1: Combine images (cosmic ray removal via median)")
+    try:
+        f336w_combined, f336w_header = load_and_combine_images(f336w_dir)
+        f555w_combined, f555w_header = load_and_combine_images(f555w_dir)
+    except Exception as e:
+        print(f"Error while combining images: {e}")
+        return
+
+    # Save combined images as FITS and TXT in working dir as well
+    try:
+        fits.writeto('f336w_combined.fits', f336w_combined, f336w_header, overwrite=True)
+        fits.writeto('f555w_combined.fits', f555w_combined, f555w_header, overwrite=True)
+        np.savetxt('f336w_combined.txt', f336w_combined, fmt="%.6e")
+        np.savetxt('f555w_combined.txt', f555w_combined, fmt="%.6e")
+        print("Saved combined images to f336w_combined.fits/.txt and f555w_combined.fits/.txt")
+    except Exception as e:
+        print(f"Could not save combined FITS/TXT files: {e}")
+
+    # Visualize medians
+    visualize_median_images(f336w_combined, f555w_combined, output_file='median_combined_images.png')
+
+    # Step 2: star finding
+    print("\nStep 2: Star finding")
+    catalog_f336w = find_stars(f336w_combined, sigma=0.5, threshold_factor=1.0, box_size=9)
+    catalog_f555w = find_stars(f555w_combined, sigma=0.5, threshold_factor=1.0, box_size=9)
+
+    # Show detected stars
+    visualize_detected_stars(f336w_combined, catalog_f336w, 'F336W - Detected Stars', 'f336w_detected_stars.png')
+    visualize_detected_stars(f555w_combined, catalog_f555w, 'F555W - Detected Stars', 'f555w_detected_stars.png')
+
+    # Step 3: Photometry
+    print("\nStep 3: Photometry")
+    catalog_f336w = perform_photometry(f336w_combined, catalog_f336w, aperture_radius=5)
+    catalog_f555w = perform_photometry(f555w_combined, catalog_f555w, aperture_radius=5)
+
+    # Step 4: cross-match
+    matched_catalog = cross_match_catalogs(catalog_f336w, catalog_f555w, max_distance=2.0)
+
+    # Save catalogs
+    save_catalog(catalog_f336w, 'catalog_f336w.txt')
+    save_catalog(catalog_f555w, 'catalog_f555w.txt')
+    save_catalog(matched_catalog, 'catalog_matched.txt')
+
+    # Plot statistics and HR diagram
+    create_hr_diagram(matched_catalog, output_file='hr_diagram.png')
+
+    # Final summary
+    print("\n" + "="*60)
+    print("FINAL SUMMARY")
+    print("="*60)
+    print(f"Sources detected in F336W: {len(catalog_f336w)}")
+    print(f"Sources detected in F555W: {len(catalog_f555w)}")
+    print(f"Matched sources: {len(matched_catalog)}")
+
+    if len(matched_catalog) > 0:
+        colors = np.array([s['mag_f336w'] - s['mag_f555w'] for s in matched_catalog])
+        print(f"Color stats (F336W - F555W): mean={np.mean(colors):.3f}, median={np.median(colors):.3f}, std={np.std(colors):.3f}")
+
+    print("\nPIPELINE FINISHED")
+
+
+if __name__ == "__main__":
+    main()
