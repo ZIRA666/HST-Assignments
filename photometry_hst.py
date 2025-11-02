@@ -16,7 +16,7 @@ import glob
 import os
 from pathlib import Path
 
-get_ipython
+#get_ipython
 # ----------------------------------------
 # 1: COSMIC RAY REMOVAL
 # ----------------------------------------
