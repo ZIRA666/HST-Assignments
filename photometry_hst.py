@@ -16,8 +16,6 @@ from scipy.ndimage import gaussian_filter, maximum_filter
 import glob
 import os
 from pathlib import Path
-
-get_ipython()
 # ----------------------------------------
 # 1: COSMIC RAY REMOVAL
 # ----------------------------------------
