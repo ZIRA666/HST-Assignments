@@ -7,10 +7,6 @@ Original file is located at
     https://colab.research.google.com/drive/1UFb8W-DlsZS1ugfgTQhpZfLc9zdytk7t
 """
 
-!git clone https://github.com/ZIRA666/HST-Assignments.git
-
-run /content/HST-Assignments/photometry_hst.py
-
 #Import some modules
 import numpy as np
 import matplotlib.pyplot as plt
@@ -21,7 +17,7 @@ import glob
 import os
 from pathlib import Path
 
-#get_ipython
+get_ipython()
 # ----------------------------------------
 # 1: COSMIC RAY REMOVAL
 # ----------------------------------------
